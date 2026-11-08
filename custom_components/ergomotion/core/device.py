@@ -103,32 +103,64 @@ class Device:
         self.current_data = data
         _LOGGER.debug("BLE status update: %s", data.hex(" "))
 
-        if len(data) >= 7:
-            head_raw = int.from_bytes(data[3:5], "little")
-            foot_raw = int.from_bytes(data[5:7], "little")
+        # Validate status packet length (official app accepts only 16, 19, or 20 bytes)
+        if len(data) not in (16, 19, 20):
+            _LOGGER.debug("Ignoring non-status packet (len=%d): %s", len(data), data.hex(" "))
+            return
 
-            self.current_state["head_position_raw"] = head_raw
-            self.current_state["foot_position_raw"] = foot_raw
+        # Check CRC: ~sum(data[:-1]) & 0xFF
+        expected_crc = (~sum(data[:-1])) & 0xFF
+        if data[-1] != expected_crc:
+            _LOGGER.debug("BLE packet CRC mismatch: expected %02X, got %02X", expected_crc, data[-1])
+            return
 
-            # Dynamic calibration: learn peak position
-            if head_raw != 0xFFFF and head_raw > 0:
-                if not self.max_positions["head"] or head_raw > self.max_positions["head"]:
-                    self.max_positions["head"] = head_raw
-                    self.calibrated["head"] = True
-                self.current_state["head_position"] = head_raw
+        # Parse motor moving flags & LED
+        stat_byte = data[14] if len(data) == 19 else data[13]
+        self.current_state["led"] = bool(stat_byte & 0x40)
+        move = stat_byte & 0x0F
+        is_moving_head = bool(move != 0x0F and (move & 1))
+        is_moving_foot = bool(move != 0x0F and (move & 2))
+        self.current_state["head_move"] = is_moving_head
+        self.current_state["foot_move"] = is_moving_foot
 
-            if foot_raw != 0xFFFF and foot_raw > 0:
-                if not self.max_positions["foot"] or foot_raw > self.max_positions["foot"]:
-                    self.max_positions["foot"] = foot_raw
-                    self.calibrated["foot"] = True
-                self.current_state["foot_position"] = foot_raw
+        # Parse raw positions
+        head_raw = int.from_bytes(data[3:5], "little")
+        foot_raw = int.from_bytes(data[5:7], "little")
 
-        if len(data) >= 15:
-            stat_byte = data[14] if len(data) == 19 else data[13]
-            self.current_state["led"] = bool(stat_byte & 0x40)
-            move = stat_byte & 0x0F
-            self.current_state["head_move"] = bool(move != 0x0F and (move & 1))
-            self.current_state["foot_move"] = bool(move != 0x0F and (move & 2))
+        # Spike rejection: if bed is not moving and in Flat preset, ignore spurious jumps
+        if self.current_preset == "Flat" and not is_moving_head and not is_moving_foot:
+            if head_raw > 1500 or foot_raw > 1500:
+                _LOGGER.debug(
+                    "Spike rejected in Flat state (head_raw=%d, foot_raw=%d)", head_raw, foot_raw
+                )
+                head_raw = 0
+                foot_raw = 0
+
+        # Small residual offset clamp to 0
+        if head_raw < 150 and not is_moving_head:
+            head_raw = 0
+        if foot_raw < 150 and not is_moving_foot:
+            foot_raw = 0
+
+        self.current_state["head_position_raw"] = head_raw
+        self.current_state["foot_position_raw"] = foot_raw
+
+        # Dynamic calibration: learn peak position only with valid non-spike values
+        if head_raw != 0xFFFF and head_raw > 1000:
+            if not self.max_positions["head"] or head_raw > self.max_positions["head"]:
+                self.max_positions["head"] = head_raw
+                self.calibrated["head"] = True
+            self.current_state["head_position"] = head_raw
+        elif head_raw == 0:
+            self.current_state["head_position"] = 0
+
+        if foot_raw != 0xFFFF and foot_raw > 1000:
+            if not self.max_positions["foot"] or foot_raw > self.max_positions["foot"]:
+                self.max_positions["foot"] = foot_raw
+                self.calibrated["foot"] = True
+            self.current_state["foot_position"] = foot_raw
+        elif foot_raw == 0:
+            self.current_state["foot_position"] = 0
 
         for handler in self.updates_state:
             handler()
